@@ -1,0 +1,83 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  name         String?
+  phone        String?
+  passwordHash String
+  role         UserRole
+  status       UserStatus @default(PENDING)
+  createdAt    DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime   @default(now()) @updatedAt @db.Timestamptz(6)
+  videos       Video[]    @relation("VideoUploader")
+  videoProgresses VideoProgress[]
+}
+
+model Video {
+  id           String   @id @default(cuid())
+  title        String
+  description  String?
+  storagePath  String
+  requiredRole UserRole
+  isPublished  Boolean  @default(false)
+  durationSeconds Int?
+  createdAt    DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+  uploadedById String?
+  uploadedBy   User?    @relation("VideoUploader", fields: [uploadedById], references: [id], onUpdate: NoAction, map: "Video_uploadedBy_fkey")
+  progresses   VideoProgress[]
+}
+
+model Post {
+  id          String       @id @default(cuid())
+  title       String
+  content     String?
+  category    PostCategory
+  isPublished Boolean      @default(true)
+  isPinned    Boolean      @default(false)
+  views       Int          @default(0)
+  publishedAt DateTime     @default(now()) @db.Timestamptz(6)
+  createdAt   DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime     @default(now()) @updatedAt @db.Timestamptz(6)
+}
+
+model VideoProgress {
+  id         String   @id @default(cuid())
+  userId     String
+  videoId    String
+  completed  Boolean  @default(false)
+  completedAt DateTime?
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime @default(now()) @updatedAt @db.Timestamptz(6)
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  video Video @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, videoId])
+}
+
+enum UserRole {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+  INSTRUCTOR
+  ADMIN
+}
+
+enum UserStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum PostCategory {
+  NOTICE
+  ACTIVITY
+}
