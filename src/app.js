@@ -9,9 +9,14 @@ const postRoutes = require('./routes/posts')
 
 const app = express()
 
+const defaultOrigins = ['http://localhost:5173']
+const originList = process.env.FRONTEND_ORIGIN
+  ? process.env.FRONTEND_ORIGIN.split(',').map((value) => value.trim()).filter(Boolean)
+  : defaultOrigins
+
 app.use(
   cors({
-    origin: process.env.FRONTEND_ORIGIN || 'http://localhost:5173',
+    origin: originList,
     credentials: true,
   }),
 )
