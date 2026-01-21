@@ -78,7 +78,7 @@ async function login(req, res) {
     { expiresIn: '7d' },
   )
 
-  const secure = process.env.NODE_ENV === 'production'
+  const secure = process.env.NODE_ENV === 'production' || req.secure
   const sameSite = secure ? 'none' : 'lax'
   res.cookie('socionet_token', token, {
     httpOnly: true,
@@ -99,7 +99,7 @@ async function login(req, res) {
 }
 
 async function logout(req, res) {
-  const secure = process.env.NODE_ENV === 'production'
+  const secure = process.env.NODE_ENV === 'production' || req.secure
   const sameSite = secure ? 'none' : 'lax'
   res.cookie('socionet_token', '', {
     httpOnly: true,
