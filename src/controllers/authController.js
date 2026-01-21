@@ -95,6 +95,7 @@ async function login(req, res) {
       role: user.role,
       status: user.status,
     },
+    token,
   })
 }
 
