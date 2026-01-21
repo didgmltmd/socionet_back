@@ -79,9 +79,10 @@ async function login(req, res) {
   )
 
   const secure = process.env.NODE_ENV === 'production'
+  const sameSite = secure ? 'none' : 'lax'
   res.cookie('socionet_token', token, {
     httpOnly: true,
-    sameSite: 'lax',
+    sameSite,
     secure,
     maxAge: 7 * 24 * 60 * 60 * 1000,
   })
@@ -99,9 +100,10 @@ async function login(req, res) {
 
 async function logout(req, res) {
   const secure = process.env.NODE_ENV === 'production'
+  const sameSite = secure ? 'none' : 'lax'
   res.cookie('socionet_token', '', {
     httpOnly: true,
-    sameSite: 'lax',
+    sameSite,
     secure,
     maxAge: 0,
   })
