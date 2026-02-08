@@ -573,6 +573,8 @@ async function getEncodeStatus(req, res) {
   if (!job) {
     return res.status(404).json({ message: 'Job not found' })
   }
+  res.set('Cache-Control', 'no-store')
+  res.set('Pragma', 'no-cache')
   return res.json({ job })
 }
 
