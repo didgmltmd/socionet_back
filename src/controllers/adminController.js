@@ -3,6 +3,7 @@ const supabase = require('../lib/supabase')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const jwt = require('jsonwebtoken')
 const { spawn } = require('child_process')
 const { Readable } = require('stream')
 const ffmpegPath = require('ffmpeg-static')
@@ -18,6 +19,7 @@ const allowedRoles = new Set([
 
 const allowedStatuses = new Set(['PENDING', 'APPROVED', 'REJECTED'])
 const storageBucket = process.env.SUPABASE_STORAGE_BUCKET
+const supabaseJwtSecret = process.env.SUPABASE_JWT_SECRET
 
 const runProcess = (command, args) =>
   new Promise((resolve, reject) => {
@@ -81,9 +83,9 @@ const encodeVideo = async (inputPath, outputPath, targetHeight) => {
     '-c:v',
     'libx264',
     '-preset',
-    'veryfast',
+    'ultrafast',
     '-crf',
-    '23',
+    '28',
     '-c:a',
     'aac',
     '-b:a',
@@ -210,23 +212,16 @@ async function uploadVideo(req, res) {
     return res.status(400).json({ message: 'Invalid file type' })
   }
 
-  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'socionet-'))
-  const outputPath = path.join(tempDir, `encoded-${Date.now()}.mp4`)
   const inputPath = req.file.path
   let uploadedPath = null
 
   try {
     const metadata = await probeVideo(inputPath)
-    const sourceHeight = metadata.height || 0
-    const targetHeight = sourceHeight >= 720 ? 720 : 480
-
-    await encodeVideo(inputPath, outputPath, targetHeight)
-
-    const encodedMeta = await probeVideo(outputPath)
     const safeName = req.file.originalname
       ? path.basename(req.file.originalname).replace(/[^a-zA-Z0-9._-]/g, '-')
-      : `video-${Date.now()}.mp4`
-    const storagePath = `videos/${Date.now()}-${safeName.replace(/\\.\\w+$/, '')}.mp4`
+      : `video-${Date.now()}${path.extname(req.file.originalname || '') || '.mp4'}`
+    const ext = path.extname(safeName) || '.mp4'
+    const storagePath = `videos/${Date.now()}-${safeName.replace(/\\.\\w+$/, '')}${ext}`
 
     const { data, error } = await supabase.storage
       .from(storageBucket)
@@ -236,18 +231,18 @@ async function uploadVideo(req, res) {
       throw new Error(error.message)
     }
 
-    const stream = fs.createReadStream(outputPath)
+    const stream = fs.createReadStream(inputPath)
     const body = Readable.toWeb ? Readable.toWeb(stream) : stream
     const response = await fetch(data.signedUrl, {
       method: 'PUT',
-      headers: { 'Content-Type': 'video/mp4' },
+      headers: { 'Content-Type': req.file.mimetype || 'video/mp4' },
       body,
       duplex: 'half',
     })
 
     if (!response.ok) {
       const message = await response.text()
-      throw new Error(message || 'Failed to upload encoded video')
+      throw new Error(message || 'Failed to upload video')
     }
 
     uploadedPath = data.path
@@ -259,19 +254,17 @@ async function uploadVideo(req, res) {
         storagePath: uploadedPath,
         requiredRole,
         isPublished: String(isPublished).toLowerCase() === 'true',
-        durationSeconds: encodedMeta.durationSeconds,
+        durationSeconds: metadata.durationSeconds,
         uploadedById: req.user.id,
       },
     })
 
     return res.status(201).json({ video })
   } catch (error) {
-    return res.status(500).json({ message: error.message || 'Encoding failed' })
+    return res.status(500).json({ message: error.message || 'Upload failed' })
   } finally {
     await Promise.allSettled([
       fs.promises.unlink(inputPath),
-      fs.promises.unlink(outputPath),
-      fs.promises.rm(tempDir, { recursive: true, force: true }),
     ])
   }
 }
@@ -341,6 +334,10 @@ async function createUploadUrl(req, res) {
     return res.status(400).json({ message: 'filePath is required' })
   }
 
+  if (!filePath.startsWith('videos/')) {
+    return res.status(400).json({ message: 'Invalid filePath' })
+  }
+
   const { data, error } = await supabase.storage
     .from(storageBucket)
     .createSignedUploadUrl(filePath)
@@ -355,6 +352,116 @@ async function createUploadUrl(req, res) {
   })
 }
 
+async function createTusToken(req, res) {
+  if (!supabaseJwtSecret) {
+    return res.status(500).json({ message: 'SUPABASE_JWT_SECRET is required' })
+  }
+
+  const now = Math.floor(Date.now() / 1000)
+  const payload = {
+    aud: 'authenticated',
+    role: 'authenticated',
+    app_role: 'ADMIN',
+    sub: req.user?.id,
+    email: req.user?.email,
+    iat: now,
+    iss: 'supabase',
+  }
+
+  const token = jwt.sign(payload, supabaseJwtSecret, { expiresIn: '6h' })
+  return res.json({ token })
+}
+
+async function encodeUploadedVideo(req, res) {
+  const { title, description, requiredRole, isPublished, storagePath } = req.body || {}
+
+  if (!storageBucket) {
+    return res.status(500).json({ message: 'Storage bucket not configured' })
+  }
+
+  if (!title || !requiredRole || !storagePath) {
+    return res
+      .status(400)
+      .json({ message: 'title, requiredRole, storagePath are required' })
+  }
+
+  if (!allowedRoles.has(requiredRole)) {
+    return res.status(400).json({ message: 'Invalid requiredRole' })
+  }
+
+  if (!storagePath.startsWith('videos/')) {
+    return res.status(400).json({ message: 'Invalid storagePath' })
+  }
+
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'socionet-encode-'))
+  const inputExt = path.extname(storagePath) || '.mp4'
+  const inputPath = path.join(tempDir, `source-${Date.now()}${inputExt}`)
+  const outputPath = path.join(tempDir, `encoded-${Date.now()}.mp4`)
+
+  try {
+    const { data, error } = await supabase.storage
+      .from(storageBucket)
+      .download(storagePath)
+
+    if (error) {
+      return res.status(500).json({ message: error.message })
+    }
+
+    if (!data) {
+      return res.status(500).json({ message: 'Failed to download video' })
+    }
+
+    const arrayBuffer = await data.arrayBuffer()
+    await fs.promises.writeFile(inputPath, Buffer.from(arrayBuffer))
+
+    const metadata = await probeVideo(inputPath)
+    const sourceHeight = metadata.height || 0
+    const targetHeight = sourceHeight >= 720 ? 720 : 480
+
+    await encodeVideo(inputPath, outputPath, targetHeight)
+
+    const encodedMeta = await probeVideo(outputPath)
+    const baseName = path.basename(storagePath).replace(/\.\w+$/, '')
+    const encodedPath = `videos/encoded-${Date.now()}-${baseName}.mp4`
+
+    const encodedBuffer = await fs.promises.readFile(outputPath)
+    const { error: uploadError } = await supabase.storage
+      .from(storageBucket)
+      .upload(encodedPath, encodedBuffer, {
+        contentType: 'video/mp4',
+        upsert: true,
+      })
+
+    if (uploadError) {
+      return res.status(500).json({ message: uploadError.message })
+    }
+
+    await supabase.storage.from(storageBucket).remove([storagePath])
+
+    const video = await prisma.video.create({
+      data: {
+        title,
+        description: description || null,
+        storagePath: encodedPath,
+        requiredRole,
+        isPublished: String(isPublished).toLowerCase() === 'true',
+        durationSeconds: encodedMeta.durationSeconds,
+        uploadedById: req.user.id,
+      },
+    })
+
+    return res.status(201).json({ video })
+  } catch (error) {
+    return res.status(500).json({ message: error.message || 'Encoding failed' })
+  } finally {
+    await Promise.allSettled([
+      fs.promises.unlink(inputPath),
+      fs.promises.unlink(outputPath),
+      fs.promises.rm(tempDir, { recursive: true, force: true }),
+    ])
+  }
+}
+
 module.exports = {
   listUsers,
   updateUserStatus,
@@ -364,5 +471,7 @@ module.exports = {
   deleteVideo,
   updateVideo,
   createUploadUrl,
+  encodeUploadedVideo,
   uploadVideo,
+  createTusToken,
 }

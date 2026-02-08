@@ -23,6 +23,8 @@ router.post('/videos', auth, requireAdmin, adminController.createVideo)
 router.patch('/videos/:id', auth, requireAdmin, adminController.updateVideo)
 router.delete('/videos/:id', auth, requireAdmin, adminController.deleteVideo)
 router.post('/videos/upload-url', auth, requireAdmin, adminController.createUploadUrl)
+router.post('/videos/tus-token', auth, requireAdmin, adminController.createTusToken)
+router.post('/videos/encode', auth, requireAdmin, adminController.encodeUploadedVideo)
 router.post(
   '/videos/upload',
   auth,
