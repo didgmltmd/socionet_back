@@ -30,7 +30,12 @@ const createJobId = () =>
 const updateEncodeJob = (jobId, patch) => {
   const job = encodeJobs.get(jobId)
   if (!job) return
-  encodeJobs.set(jobId, { ...job, ...patch, updatedAt: Date.now() })
+  let nextPatch = patch
+  if (typeof patch?.progress === 'number' && typeof job.progress === 'number') {
+    const mergedProgress = Math.max(job.progress, patch.progress)
+    nextPatch = { ...patch, progress: mergedProgress }
+  }
+  encodeJobs.set(jobId, { ...job, ...nextPatch, updatedAt: Date.now() })
 }
 
 const scheduleJobCleanup = (jobId, delayMs = 1000 * 60 * 60) => {
@@ -152,11 +157,18 @@ const encodeVideo = async (inputPath, outputPath, targetHeight, durationSeconds,
   })
 }
 
-const streamToFile = async (body, filePath) => {
+const streamToFile = async (body, filePath, onProgress, totalBytes) => {
   if (!body) {
     throw new Error('No response body')
   }
   const readable = typeof body.pipe === 'function' ? body : Readable.fromWeb(body)
+  let downloaded = 0
+  if (typeof onProgress === 'function') {
+    readable.on('data', (chunk) => {
+      downloaded += chunk.length
+      onProgress(downloaded, totalBytes)
+    })
+  }
   await pipeline(readable, fs.createWriteStream(filePath))
 }
 
@@ -473,7 +485,7 @@ async function encodeUploadedVideo(req, res) {
     const inputPath = path.join(tempDir, `source-${Date.now()}${inputExt}`)
     const outputPath = path.join(tempDir, `encoded-${Date.now()}.mp4`)
 
-    updateEncodeJob(jobId, { status: 'processing', progress: 5, message: '다운로드 중' })
+    updateEncodeJob(jobId, { status: 'downloading', progress: 5, message: '다운로드 중' })
     try {
       const { data: signedData, error: signedError } = await supabase.storage
         .from(storageBucket)
@@ -487,12 +499,24 @@ async function encodeUploadedVideo(req, res) {
         throw new Error('Failed to create signed url')
       }
 
-      const downloadResponse = await fetch(signedData.signedUrl)
+      const downloadController = new AbortController()
+      const downloadTimeout = setTimeout(() => downloadController.abort(), 45 * 60 * 1000)
+      const downloadResponse = await fetch(signedData.signedUrl, {
+        signal: downloadController.signal,
+      })
       if (!downloadResponse.ok) {
         const message = await downloadResponse.text()
         throw new Error(message || 'Failed to download video')
       }
-      await streamToFile(downloadResponse.body, inputPath)
+      const totalBytesHeader = downloadResponse.headers.get('content-length')
+      const totalBytes = totalBytesHeader ? Number(totalBytesHeader) : undefined
+      await streamToFile(downloadResponse.body, inputPath, (downloaded, total) => {
+        if (total && Number.isFinite(total) && total > 0) {
+          const progress = 5 + Math.min(20, Math.round((downloaded / total) * 20))
+          updateEncodeJob(jobId, { status: 'downloading', progress, message: '다운로드 중' })
+        }
+      }, totalBytes)
+      clearTimeout(downloadTimeout)
 
       updateEncodeJob(jobId, { status: 'encoding', progress: 30, message: '인코딩 중' })
       const metadata = await probeVideo(inputPath)
