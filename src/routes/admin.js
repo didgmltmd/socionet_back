@@ -25,6 +25,7 @@ router.delete('/videos/:id', auth, requireAdmin, adminController.deleteVideo)
 router.post('/videos/upload-url', auth, requireAdmin, adminController.createUploadUrl)
 router.post('/videos/tus-token', auth, requireAdmin, adminController.createTusToken)
 router.post('/videos/encode', auth, requireAdmin, adminController.encodeUploadedVideo)
+router.get('/videos/encode/:id', auth, requireAdmin, adminController.getEncodeStatus)
 router.post(
   '/videos/upload',
   auth,

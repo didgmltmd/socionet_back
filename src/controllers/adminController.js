@@ -1,11 +1,13 @@
 const prisma = require('../lib/prisma')
 const supabase = require('../lib/supabase')
 const fs = require('fs')
+const crypto = require('crypto')
 const path = require('path')
 const os = require('os')
 const jwt = require('jsonwebtoken')
 const { spawn } = require('child_process')
 const { Readable } = require('stream')
+const { pipeline } = require('stream/promises')
 const ffmpegPath = require('ffmpeg-static')
 const ffprobePath = require('ffprobe-static').path
 
@@ -20,6 +22,20 @@ const allowedRoles = new Set([
 const allowedStatuses = new Set(['PENDING', 'APPROVED', 'REJECTED'])
 const storageBucket = process.env.SUPABASE_STORAGE_BUCKET
 const supabaseJwtSecret = process.env.SUPABASE_JWT_SECRET
+const encodeJobs = new Map()
+
+const createJobId = () =>
+  (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex'))
+
+const updateEncodeJob = (jobId, patch) => {
+  const job = encodeJobs.get(jobId)
+  if (!job) return
+  encodeJobs.set(jobId, { ...job, ...patch, updatedAt: Date.now() })
+}
+
+const scheduleJobCleanup = (jobId, delayMs = 1000 * 60 * 60) => {
+  setTimeout(() => encodeJobs.delete(jobId), delayMs).unref?.()
+}
 
 const runProcess = (command, args) =>
   new Promise((resolve, reject) => {
@@ -70,30 +86,78 @@ const probeVideo = async (filePath) => {
   }
 }
 
-const encodeVideo = async (inputPath, outputPath, targetHeight) => {
+const encodeVideo = async (inputPath, outputPath, targetHeight, durationSeconds, onProgress) => {
   if (!ffmpegPath) {
     throw new Error('ffmpeg is not available')
   }
-  await runProcess(ffmpegPath, [
-    '-y',
-    '-i',
-    inputPath,
-    '-vf',
-    `scale=-2:${targetHeight}`,
-    '-c:v',
-    'libx264',
-    '-preset',
-    'ultrafast',
-    '-crf',
-    '28',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '128k',
-    '-movflags',
-    '+faststart',
-    outputPath,
-  ])
+  await new Promise((resolve, reject) => {
+    const args = [
+      '-y',
+      '-i',
+      inputPath,
+      '-vf',
+      `scale=-2:${targetHeight}`,
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-crf',
+      '28',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-movflags',
+      '+faststart',
+      '-progress',
+      'pipe:1',
+      '-nostats',
+      outputPath,
+    ]
+    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let buffer = ''
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk.toString()
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      lines.forEach((line) => {
+        const trimmed = line.trim()
+        if (!trimmed) return
+        if (trimmed.startsWith('out_time_ms=')) {
+          const value = Number(trimmed.replace('out_time_ms=', ''))
+          if (Number.isFinite(value) && durationSeconds && durationSeconds > 0) {
+            const progress = Math.min(
+              95,
+              Math.round((value / (durationSeconds * 1000000)) * 100),
+            )
+            if (typeof onProgress === 'function') {
+              onProgress(progress)
+            }
+          }
+        }
+      })
+    })
+    let stderr = ''
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString()
+    })
+    child.on('error', reject)
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve()
+        return
+      }
+      reject(new Error(stderr || 'Encoding failed'))
+    })
+  })
+}
+
+const streamToFile = async (body, filePath) => {
+  if (!body) {
+    throw new Error('No response body')
+  }
+  const readable = typeof body.pipe === 'function' ? body : Readable.fromWeb(body)
+  await pipeline(readable, fs.createWriteStream(filePath))
 }
 
 async function listUsers(req, res) {
@@ -221,7 +285,7 @@ async function uploadVideo(req, res) {
       ? path.basename(req.file.originalname).replace(/[^a-zA-Z0-9._-]/g, '-')
       : `video-${Date.now()}${path.extname(req.file.originalname || '') || '.mp4'}`
     const ext = path.extname(safeName) || '.mp4'
-    const storagePath = `videos/${Date.now()}-${safeName.replace(/\\.\\w+$/, '')}${ext}`
+    const storagePath = `videos/${Date.now()}-${safeName.replace(/\.\w+$/, '')}${ext}`
 
     const { data, error } = await supabase.storage
       .from(storageBucket)
@@ -263,9 +327,7 @@ async function uploadVideo(req, res) {
   } catch (error) {
     return res.status(500).json({ message: error.message || 'Upload failed' })
   } finally {
-    await Promise.allSettled([
-      fs.promises.unlink(inputPath),
-    ])
+    await Promise.allSettled([fs.promises.unlink(inputPath)])
   }
 }
 
@@ -393,73 +455,125 @@ async function encodeUploadedVideo(req, res) {
     return res.status(400).json({ message: 'Invalid storagePath' })
   }
 
-  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'socionet-encode-'))
-  const inputExt = path.extname(storagePath) || '.mp4'
-  const inputPath = path.join(tempDir, `source-${Date.now()}${inputExt}`)
-  const outputPath = path.join(tempDir, `encoded-${Date.now()}.mp4`)
+  const jobId = createJobId()
+  encodeJobs.set(jobId, {
+    id: jobId,
+    status: 'queued',
+    progress: 0,
+    message: '대기중',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  })
 
-  try {
-    const { data, error } = await supabase.storage
-      .from(storageBucket)
-      .download(storagePath)
+  res.status(202).json({ jobId })
 
-    if (error) {
-      return res.status(500).json({ message: error.message })
-    }
+  setImmediate(async () => {
+    const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'socionet-encode-'))
+    const inputExt = path.extname(storagePath) || '.mp4'
+    const inputPath = path.join(tempDir, `source-${Date.now()}${inputExt}`)
+    const outputPath = path.join(tempDir, `encoded-${Date.now()}.mp4`)
 
-    if (!data) {
-      return res.status(500).json({ message: 'Failed to download video' })
-    }
+    updateEncodeJob(jobId, { status: 'processing', progress: 5, message: '다운로드 중' })
+    try {
+      const { data: signedData, error: signedError } = await supabase.storage
+        .from(storageBucket)
+        .createSignedUrl(storagePath, 60 * 60)
 
-    const arrayBuffer = await data.arrayBuffer()
-    await fs.promises.writeFile(inputPath, Buffer.from(arrayBuffer))
+      if (signedError) {
+        throw new Error(signedError.message)
+      }
 
-    const metadata = await probeVideo(inputPath)
-    const sourceHeight = metadata.height || 0
-    const targetHeight = sourceHeight >= 720 ? 720 : 480
+      if (!signedData?.signedUrl) {
+        throw new Error('Failed to create signed url')
+      }
 
-    await encodeVideo(inputPath, outputPath, targetHeight)
+      const downloadResponse = await fetch(signedData.signedUrl)
+      if (!downloadResponse.ok) {
+        const message = await downloadResponse.text()
+        throw new Error(message || 'Failed to download video')
+      }
+      await streamToFile(downloadResponse.body, inputPath)
 
-    const encodedMeta = await probeVideo(outputPath)
-    const baseName = path.basename(storagePath).replace(/\.\w+$/, '')
-    const encodedPath = `videos/encoded-${Date.now()}-${baseName}.mp4`
+      updateEncodeJob(jobId, { status: 'encoding', progress: 30, message: '인코딩 중' })
+      const metadata = await probeVideo(inputPath)
+      const sourceHeight = metadata.height || 0
+      const targetHeight = sourceHeight >= 720 ? 720 : 480
 
-    const encodedBuffer = await fs.promises.readFile(outputPath)
-    const { error: uploadError } = await supabase.storage
-      .from(storageBucket)
-      .upload(encodedPath, encodedBuffer, {
-        contentType: 'video/mp4',
-        upsert: true,
+      await encodeVideo(inputPath, outputPath, targetHeight, metadata.durationSeconds, (progress) => {
+        updateEncodeJob(jobId, { status: 'encoding', progress, message: '인코딩 중' })
       })
 
-    if (uploadError) {
-      return res.status(500).json({ message: uploadError.message })
+      updateEncodeJob(jobId, { status: 'uploading', progress: 90, message: '업로드 중' })
+      const encodedMeta = await probeVideo(outputPath)
+      const baseName = path.basename(storagePath).replace(/\.[^.]+$/, '')
+      const encodedPath = `videos/encoded-${Date.now()}-${baseName}.mp4`
+
+      const { data: uploadData, error: uploadUrlError } = await supabase.storage
+        .from(storageBucket)
+        .createSignedUploadUrl(encodedPath)
+
+      if (uploadUrlError) {
+        throw new Error(uploadUrlError.message)
+      }
+
+      const uploadStream = fs.createReadStream(outputPath)
+      const uploadBody = Readable.toWeb ? Readable.toWeb(uploadStream) : uploadStream
+      const uploadResponse = await fetch(uploadData.signedUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'video/mp4' },
+        body: uploadBody,
+        duplex: 'half',
+      })
+
+      if (!uploadResponse.ok) {
+        const message = await uploadResponse.text()
+        throw new Error(message || 'Failed to upload encoded video')
+      }
+
+      await supabase.storage.from(storageBucket).remove([storagePath])
+
+      const video = await prisma.video.create({
+        data: {
+          title,
+          description: description || null,
+          storagePath: encodedPath,
+          requiredRole,
+          isPublished: String(isPublished).toLowerCase() === 'true',
+          durationSeconds: encodedMeta.durationSeconds,
+          uploadedById: req.user.id,
+        },
+      })
+
+      updateEncodeJob(jobId, {
+        status: 'done',
+        progress: 100,
+        message: '완료',
+        videoId: video.id,
+      })
+      scheduleJobCleanup(jobId)
+    } catch (error) {
+      updateEncodeJob(jobId, {
+        status: 'error',
+        message: error.message || 'Encoding failed',
+      })
+      scheduleJobCleanup(jobId)
+    } finally {
+      await Promise.allSettled([
+        fs.promises.unlink(inputPath),
+        fs.promises.unlink(outputPath),
+        fs.promises.rm(tempDir, { recursive: true, force: true }),
+      ])
     }
+  })
+}
 
-    await supabase.storage.from(storageBucket).remove([storagePath])
-
-    const video = await prisma.video.create({
-      data: {
-        title,
-        description: description || null,
-        storagePath: encodedPath,
-        requiredRole,
-        isPublished: String(isPublished).toLowerCase() === 'true',
-        durationSeconds: encodedMeta.durationSeconds,
-        uploadedById: req.user.id,
-      },
-    })
-
-    return res.status(201).json({ video })
-  } catch (error) {
-    return res.status(500).json({ message: error.message || 'Encoding failed' })
-  } finally {
-    await Promise.allSettled([
-      fs.promises.unlink(inputPath),
-      fs.promises.unlink(outputPath),
-      fs.promises.rm(tempDir, { recursive: true, force: true }),
-    ])
+async function getEncodeStatus(req, res) {
+  const { id } = req.params
+  const job = encodeJobs.get(id)
+  if (!job) {
+    return res.status(404).json({ message: 'Job not found' })
   }
+  return res.json({ job })
 }
 
 module.exports = {
@@ -472,6 +586,7 @@ module.exports = {
   updateVideo,
   createUploadUrl,
   encodeUploadedVideo,
+  getEncodeStatus,
   uploadVideo,
   createTusToken,
 }
