@@ -11,7 +11,11 @@ const app = express()
 
 app.set('trust proxy', 1)
 
-const defaultOrigins = ['http://localhost:5173', 'https://socionet-front-rsah.onrender.com']
+const defaultOrigins = [
+  'http://localhost:5173',
+  'https://socionet-front-rsah.onrender.com',
+  'https://www.ksocionet.com',
+]
 const originList = process.env.FRONTEND_ORIGIN
   ? process.env.FRONTEND_ORIGIN.split(',').map((value) => value.trim()).filter(Boolean)
   : defaultOrigins
